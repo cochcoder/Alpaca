@@ -11,6 +11,24 @@ from ...sql_manager import generate_uuid, dict_to_metadata_string, Instance as S
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for values that are constant for the lifetime of the process
+_cached_user_info = {}  # share_name int -> display name str or None
+
+def _get_user_display_name(share_name: int):
+    if share_name not in _cached_user_info:
+        try:
+            if share_name == 1:
+                _cached_user_info[share_name] = getpass.getuser().title()
+            elif share_name == 2:
+                pw = pwd.getpwnam(getpass.getuser())
+                gecos_parts = pw.pw_gecos.split(',')
+                _cached_user_info[share_name] = gecos_parts[0].title() if gecos_parts else None
+            else:
+                _cached_user_info[share_name] = None
+        except Exception:
+            _cached_user_info[share_name] = None
+    return _cached_user_info[share_name]
+
 # Base instance, don't use directly
 class BaseInstance:
     description = None
@@ -102,15 +120,10 @@ class BaseInstance:
         self.generate_response(bot_message, chat, messages, model, available_tools=available_tools)
 
     def generate_response(self, bot_message, chat, messages:list, model:str, available_tools:dict={}):
-        if self.properties.get('share_name', 0) > 0:
-            user_display_name = None
-            if self.properties.get('share_name') == 1:
-                user_display_name = getpass.getuser().title()
-            elif self.properties.get('share_name') == 2:
-                gecos_temp = pwd.getpwnam(getpass.getuser()).pw_gecos.split(',')
-                if len(gecos_temp) > 0:
-                    user_display_name = pwd.getpwnam(getpass.getuser()).pw_gecos.split(',')[0].title()
-
+        props = self.properties
+        share_name = props.get('share_name', 0)
+        if share_name > 0:
+            user_display_name = _get_user_display_name(share_name)
             if user_display_name:
                 messages.insert(0, {
                     'role': 'system',
@@ -128,17 +141,18 @@ class BaseInstance:
         params = {
             "model": model,
             "stream": True,
-            "think": self.properties.get('think', False) and 'thinking' in model_info.get('capabilities', []),
-            "keep_alive": self.properties.get('keep_alive', 300),
+            "think": props.get('think', False) and 'thinking' in model_info.get('capabilities', []),
+            "keep_alive": props.get('keep_alive', 300),
             "tools": [v.get_metadata() for v in available_tools.values()]
         }
 
-        if self.properties.get("override_parameters"):
+        override_parameters = props.get("override_parameters")
+        if override_parameters:
             params["options"] = {}
-            params["options"]["temperature"] = self.properties.get('temperature', 0.7)
-            params["options"]["num_ctx"] = self.properties.get('num_ctx', 16384)
-            if self.properties.get('seed', 0) != 0:
-                params["options"]["seed"] = self.properties.get('seed')
+            params["options"]["temperature"] = props.get('temperature', 0.7)
+            params["options"]["num_ctx"] = props.get('num_ctx', 16384)
+            if props.get('seed', 0) != 0:
+                params["options"]["seed"] = props.get('seed')
 
         metadata_string = ""
         tool_calls = []
@@ -247,7 +261,7 @@ class BaseInstance:
             if self.row:
                 GLib.idle_add(self.row.get_parent().unselect_all)
 
-        if not self.properties.get('show_response_metadata'):
+        if not props.get('show_response_metadata'):
             metadata_string = None
         bot_message.finish_generation(metadata_string)
 
@@ -327,6 +341,11 @@ class BaseInstance:
             )
 
     def get_local_models(self) -> list:
+        now = time.time()
+        cache = getattr(self, '_local_models_cache', None)
+        cache_time = getattr(self, '_local_models_cache_time', 0)
+        if cache is not None and now - cache_time < 10:
+            return cache
         try:
             model_list = []
 
@@ -339,9 +358,10 @@ class BaseInstance:
                     'details': m.details
                 })
 
+            self._local_models_cache = model_list
+            self._local_models_cache_time = now
             return model_list
 
-            return [{'name': m.model} for m in models if m.model]
         except Exception as e:
             if self.instance_type != 'ollama:managed' or is_ollama_installed():
                 dialog.simple_error(
@@ -370,8 +390,15 @@ class BaseInstance:
         return {}
 
     def get_model_info(self, model_name:str) -> dict:
+        cache = getattr(self, '_model_info_cache', None)
+        if cache is None:
+            self._model_info_cache = {}
+            cache = self._model_info_cache
+        if model_name in cache:
+            return cache[model_name]
         try:
             response = self.client.show(model_name)
+            cache[model_name] = response
             return response
         except Exception as e:
             logger.error(e)
@@ -433,7 +460,13 @@ class BaseInstance:
     def delete_model(self, model_name:str):
         try:
             response = self.client.delete(model_name)
-            return response.status == 'success'
+            if response.status == 'success':
+                # Invalidate caches for the deleted model
+                if hasattr(self, '_model_info_cache'):
+                    self._model_info_cache.pop(model_name, None)
+                self._local_models_cache = None
+                self._local_models_cache_time = 0
+                return True
         except Exception as e:
             logger.error(e)
         return False
@@ -470,7 +503,7 @@ class OllamaManaged(BaseInstance):
     def __init__(self, instance_id:str, properties:dict):
         self.instance_id = instance_id
         self.process = None
-        self.log_raw = ''
+        self._log_buffer = []
         self.rocm_status = 0 # 0: no need, 1: using Vulkan 2: wants rocm, 3: rocm ok
         self.version_number = ''
         self.last_auto_version_check_time = 0
@@ -486,6 +519,10 @@ class OllamaManaged(BaseInstance):
                 self.properties[key] = properties.get(key, self.default_properties.get(key))
 
         self.client = None
+
+    @property
+    def log_raw(self) -> str:
+        return ''.join(self._log_buffer)
 
     def signin_request(self) -> str:
         # For use with cloud models, returns the url even though it also opens it
@@ -512,7 +549,7 @@ class OllamaManaged(BaseInstance):
         with pipe:
             try:
                 for line in iter(pipe.readline, ''):
-                    self.log_raw += line
+                    self._log_buffer.append(line)
                     print(line, end='')
                     if 'msg="model request too large for system"' in line and self.row:
                         dialog.show_toast(_("Model request too large for system"), self.row.get_root())
@@ -559,7 +596,7 @@ class OllamaManaged(BaseInstance):
                 logger.error(f"Error stopping Ollama process: {e}")
             finally:
                 self.process = None
-                self.log_raw += '\nOllama stopped by Alpaca\n'
+                self._log_buffer.append('\nOllama stopped by Alpaca\n')
                 logger.info("Stopped Alpaca's Ollama instance")
         self.client = None
 
@@ -575,9 +612,7 @@ class OllamaManaged(BaseInstance):
                     params["OLLAMA_ORIGINS"] = "chrome-extension://*,moz-extension://*,safari-web-extension://*,http://0.0.0.0,http://127.0.0.1"
                 else:
                     params["OLLAMA_ORIGINS"] = params.get("OLLAMA_HOST")
-                for key in list(params):
-                    if not params.get(key):
-                        del params[key]
+                params = {k: v for k, v in params.items() if v}
                 self.process = subprocess.Popen(
                     [OLLAMA_BINARY_PATH, "serve"],
                     env={**os.environ, **params},

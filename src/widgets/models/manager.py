@@ -130,7 +130,7 @@ class ModelManager(Adw.NavigationPage):
         instance = self.get_root().get_current_instance()
 
         # Normal Models
-        instance.local_models = None # Reset cache
+        instance._local_models_cache_time = 0  # Invalidate cached model list
         local_models = instance.get_local_models()
         for model in local_models:
             self.create_text_model(

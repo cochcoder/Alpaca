@@ -184,10 +184,39 @@ class AvailableModelDialog(Adw.Dialog):
         if tag is None:
             tag = ''
         model_name = '{}:{}'.format(self.model.get_name(), tag).removesuffix(':').strip()
-        confirm_pull_model(
-            window=window,
-            model_name=model_name
+
+        # Determine whether this tag is a cloud variant (no local download)
+        tag_info = next((t for t in self.model.data.get('tags', []) if t[0] == tag), None)
+        is_cloud = not tag_info or not tag_info[1] or tag_info[1] == 'cloud'
+
+        # Offer quantization selection only for locally-pulled, non-latest tags
+        instance = window.get_current_instance()
+        show_quant = (
+            not is_cloud
+            and tag and tag != 'latest'
+            and instance.instance_type in ('ollama', 'ollama:managed')
         )
+
+        if show_quant:
+            default_label = _('Default')
+            quant_options = [default_label, 'Q4_K_M', 'Q4_0', 'Q5_K_M', 'Q5_0', 'Q8_0', 'Q6_K']
+
+            def pull_with_quantization(selected_quant):
+                final_name = model_name
+                if selected_quant != default_label:
+                    final_name = '{}-{}'.format(model_name, selected_quant.lower())
+                confirm_pull_model(window=window, model_name=final_name)
+
+            dialog.simple_dropdown(
+                parent=window,
+                heading=_('Select Quantization'),
+                body=_("Choose the quantization format for '{}'. Q4_K_M is recommended for most users.").format(model_name),
+                callback=pull_with_quantization,
+                items=quant_options,
+                button_name=_('Pull')
+            )
+        else:
+            confirm_pull_model(window=window, model_name=model_name)
 
     @Gtk.Template.Callback()
     def webpage_requested(self, button):
