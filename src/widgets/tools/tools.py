@@ -3,7 +3,7 @@
 from gi.repository import GObject, GLib, Gio, Gtk
 from .. import activities, dialog, attachments, chat
 from ...sql_manager import Instance as SQL, generate_uuid
-import os, threading
+import os, threading, time
 
 class Property:
     def __init__(self, name:str, description:str, var_type:str, required:bool=False):
@@ -95,8 +95,11 @@ class WebSearch(Base):
             return "Error: Search term was not provided"
 
         GLib.idle_add(self.start_work, search_term, bot_message)
+        deadline = time.monotonic() + 60
         while self.result == 0:
-            continue
+            if time.monotonic() > deadline:
+                return "Error: Search timed out"
+            time.sleep(0.1)
 
         if self.result:
             return self.result

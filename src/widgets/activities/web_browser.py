@@ -193,16 +193,12 @@ class WebBrowser(WebKit.WebView):
 
         # Use Different Thread
         def on_result_load():
-            query_hostname = urlparse(query_url).hostname.lower()
-            if query_hostname.startswith('www.'):
-                query_hostname = query_hostname[4:]
-            current_hostname = urlparse(self.get_uri()).hostname.lower()
-            if current_hostname.startswith('www.'):
-                current_hostname = current_hostname[4:]
-            if not query_hostname == current_hostname:
-                self.on_load_callback = lambda: None
-                GLib.idle_add(self.attachment_requested, save_func)
-                GLib.idle_add(self.close)
+            # Always extract the current page content and close; this handles both
+            # the success case (landed on a result page) and the fallback case
+            # (still on the search page due to a failed/redirected navigation).
+            self.on_load_callback = lambda: None
+            GLib.idle_add(self.attachment_requested, save_func)
+            GLib.idle_add(self.close)
 
         def on_html_extracted(raw_html):
             self.on_load_callback = lambda: threading.Thread(target=on_result_load, daemon=True).start()
@@ -210,20 +206,34 @@ class WebBrowser(WebKit.WebView):
                 soup = BeautifulSoup(raw_html, "html.parser")
                 # I know, really sofisticated
                 results = soup.select('a.result-title') + soup.select('a[data-testid="result-title-a"]') + soup.select('a:has(h3)')
-                if len(results) > 0:
-                    result = random.choice(results[min(5, len(results)):])
-                    GLib.timeout_add(5000, self.load_uri, result["href"])
+                if results:
+                    # Skip top results (often ads); fall back to all results if fewer than 5
+                    candidates = results[5:] or results
+                    result = random.choice(candidates)
+                    GLib.idle_add(self.load_uri, result["href"])
+                else:
+                    # No result links found — return search page content as a fallback
+                    self.on_load_callback = lambda: None
+                    GLib.idle_add(self.attachment_requested, save_func)
+                    GLib.idle_add(self.close)
 
         # Use Different Thread
         def on_search_page_ready():
-            GLib.timeout_add(5000, self.extract_html, on_html_extracted)
+            GLib.idle_add(self.extract_html, on_html_extracted)
 
         self.on_load_callback = lambda: threading.Thread(target=on_search_page_ready, daemon=True).start()
-        GLib.timeout_add(5000, self.load_uri, query_url.format(search_term))
+        GLib.idle_add(self.load_uri, query_url.format(search_term))
 
     def close(self):
-        # Only close if it's a dialog
+        # Close if in a dialog
         parent = self.get_ancestor(Adw.Dialog)
         if parent:
             parent.close()
+            return
+        # Close if shown as a tab
+        tab_view = self.get_ancestor(Adw.TabView)
+        if tab_view:
+            page = tab_view.get_page(self)
+            if page:
+                tab_view.close_page(page)
 
